@@ -36,13 +36,12 @@ for p in [1,2,3]:   # k'
         fieldList = generateFieldsCompat(controlMesh,"RT",[p,p])          # soultion field basis over the control mesh, rt type
         splineGenerator = FieldListSpline(controlMesh,fieldList)
 
-        # Strong homogeneous dirichelt BC everywhere
-        for field in range(0,2):
+        # Strong normal BC only, use Nitsche for tangential
+        for field in [0,1]: # u,v
             scalarSpline = splineGenerator.getFieldSpline(field)
-            for side in range(0,2):
-                for direction in range(0,2):
-                    sideDofs = scalarSpline.getSideDofs(direction,side)
-                    splineGenerator.addZeroDofs(field,sideDofs)
+            for side in [0,1]: # 1d: points, 2d: edges, 3d: faces
+                sideDofs = scalarSpline.getSideDofs(field,side)
+                splineGenerator.addZeroDofs(field,sideDofs)
 
         # extraction and parameters
         spline = ExtractedBSplineRT(splineGenerator,QUAD_DEG)
@@ -52,6 +51,44 @@ for p in [1,2,3]:   # k'
         dS  =  dS(metadata = {"quadrature_degree":QUAD_DEG}) #interior facets
         dx  =  dx(metadata = {"quadrature_degree":QUAD_DEG}) #interior
         x = spline.spatialCoordinates()
+
+        # Nitsche's for tangential BC, set-up
+        class Right(SubDomain):
+            def inside(self,x,on_boundary):
+                return near(x[0],1.0)
+
+        class Left(SubDomain):
+            def inside(self,x,on_boundary):
+                return near(x[0],0.0)
+
+        class Top(SubDomain):
+            def inside(self,x,on_boundary):
+                return near(x[1],1.0)
+
+        class Bottom(SubDomain):
+            def inside(self,x,on_boundary):
+                return near(x[1],0.0)
+
+        # Declare sub-subdomains
+        top    = Top()
+        bottom = Bottom()
+        right  = Right()
+        left   = Left()
+
+        # Initialize mesh function for boundary domains
+        boundaries = MeshFunction("size_t", spline.mesh, 1, spline.mesh.domains()) # 1 for edge, 2 for face
+        boundaries.set_all(0)
+        top.mark(boundaries, 1)
+        bottom.mark(boundaries, 2)
+        right.mark(boundaries, 3)
+        left.mark(boundaries, 4)
+
+
+        # Nitsche's parameters
+        Cb  = 5.0*(p+1)                                      # penalty for Nitsche :  by J.Evans's dissertation(2011)
+        ds = ds(subdomain_data = boundaries)
+        ds  =  ds(metadata = {"quadrature_degree":QUAD_DEG}) # boundary facets
+
 
         #exact solutions
 
@@ -64,15 +101,30 @@ for p in [1,2,3]:   # k'
         u_exact = as_vector((u_ex,v_ex))
 
 
+        # use iterative solver instead
+        # MAX_KSP_IT = 5000
+        # spline.linearSolver = PETScKrylovSolver("gmres","jacobi")
+        # spline.linearSolver.parameters["relative_tolerance"] = 1e-2
+        # spline.linearSolver.parameters["error_on_nonconvergence"] = False
+        # spline.linearSolver.parameters["maximum_iterations"] = MAX_KSP_IT
+        # spline.linearSolver.ksp().setGMRESRestart(MAX_KSP_IT)
+        spline.relativeTolerance = 1e-8
+        spline.maxIters = 50
+        div_pent = 1e4
+
+
         for Re in [10]:
             nu = 1.0/Re
 
-            outFile1 = open('nm_p=' + str(p) + '_Re='+str(Re)+ '_m=' + str(resol) +'.csv', mode)
-            outFile2 = open('ss_p=' + str(p) + '_Re='+str(Re)+ '_m=' + str(resol) +'.csv', mode)
+            #outFile1 = open('nm_p=' + str(p) + '_Re='+str(Re)+ '_m=' + str(resol) +'.csv', mode)
+            outFile2 = open('error/ss_p=' + str(p) + '_Re='+str(Re)+ '_m=' + str(resol) +'.csv', mode)
 
             # solving
-            for case in [1,2]:
+            for case in [2]:
                 if case == 1: # no model
+
+                    #-------------------------------------------------------#
+                    #         NO NITSCHE'S FOR UNSTABILIZED FOR NOW         #
 
                     # reinitialization, otherwise last results will be initialized
                     u_hat = Function(spline.V)
@@ -92,7 +144,7 @@ for p in [1,2,3]:   # k'
 
                     R     = I_adv + I_diff - f
 
-                    spline.iteratedDivFreeSolve(R,u_hat,v_hat,penalty=Constant(1e4)) # iterative penalty solver
+                    spline.iteratedDivFreeSolve(R,u_hat,v_hat,penalty=Constant(div_pent)) # iterative penalty solver
 
                     # save the solution
                     u_sol = spline.projectScalarOntoLinears(u[0])
@@ -131,7 +183,39 @@ for p in [1,2,3]:   # k'
 
                     f = inner(grad(u_exact)*u_exact,v)*dx - 2.0*nu*inner(div(nablas(u_exact)),v)*dx + inner(grad(p_ex),v)*dx
 
+                    # start to build Nitsche term
+                    # top edge
+                    ut = as_vector([u[0],0.0])
+                    vt = as_vector([v[0],0.0])
 
+                    It_c = -2.0*nu*inner(nablas(ut)*n,vt) * ds(1)
+                    It_s = -2.0*nu*inner(nablas(vt)*n,ut) * ds(1)
+                    It_p = Cb*nu/h*inner(vt,ut) * ds(1)
+
+                    # bottom edge, u[0] = 0
+                    ub = as_vector([u[0],0.0])
+                    vb = as_vector([v[0],0.0])
+
+                    Ib_c = -2.0*nu*inner(nablas(ub)*n,vb) * ds(2)
+                    Ib_s = -2.0*nu*inner(nablas(vb)*n,ub) * ds(2)
+                    Ib_p = Cb*nu/h*inner(vb,ub) * ds(2)
+
+                    # left/right, u[1] = 0
+                    ulr = as_vector([0.0,u[1]])
+                    vlr = as_vector([0.0,v[1]])
+
+                    Ilr_c = -2.0*nu*inner(nablas(ulr)*n,vlr) * ( ds(3) + ds(4) )
+                    Ilr_s = -2.0*nu*inner(nablas(vlr)*n,ulr) * ( ds(3) + ds(4) )
+                    Ilr_p = Cb*nu/h*inner(vlr,ulr) * ( ds(3) + ds(4) )
+
+
+                    I_c = It_c + Ib_c + Ilr_c # consistency
+                    I_s = It_s + Ib_s + Ilr_s # symmetry
+                    I_p = It_p + Ib_p + Ilr_p # penalty
+
+                    I_Nit = I_c + I_s + I_p
+
+                    # Skeleton stabilization term
                     def Min(a, b): return (a+b-abs(a-b))/Constant(2.0)
                     gamma = 1*10**(-p-1)
                     print('case='+str(case)+ ', p=' + str(p) + ', m=' + str(resol)+', gamma='+str(gamma)+ ', Re=' + str(Re))
@@ -162,9 +246,9 @@ for p in [1,2,3]:   # k'
                     J_n   = eta_n *  inner( jump_u_n , jump_v_n  )  * dS
 
 
-                    R     = I_adv + I_diff - f + J_n 
+                    R     = I_adv + I_diff - f + J_n + I_Nit
 
-                    spline.iteratedDivFreeSolve(R,u_hat,v_hat,penalty=Constant(1e4)) # iterative penalty method
+                    spline.iteratedDivFreeSolve(R,u_hat,v_hat,penalty=Constant(div_pent)) # iterative penalty method
 
 
                     # save the solution
@@ -189,7 +273,7 @@ for p in [1,2,3]:   # k'
                     outFile2.write(str(L2_err) + "," + str(Semi_H1_err) + "\n")
 
 
-            outFile1.close()
+            #outFile1.close()
             outFile2.close()
 
 
